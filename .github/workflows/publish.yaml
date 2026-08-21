@@ -94,12 +94,57 @@ jobs:
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      # THE BASE IS DECLARED IN tailscale/build.yaml AND RESOLVED BY ONE SHARED
+      # IMPLEMENTATION. A pipeline that looks it up any other way is a defect
+      # even when it currently produces the right answer — and this one did
+      # produce the right answer, which is precisely why it survived.
+      #
+      # The step that was here emitted a LITERAL, under a comment that said
+      # "Base images from build.yaml". It read no file. The literal happened to
+      # equal every value in tailscale/build.yaml (measured 2026-08-20, all
+      # three arches identical), so nothing was ever wrong and nothing ever
+      # went red. Editing tailscale/build.yaml would have changed nothing about
+      # the image that was built — the same coupling that, in
+      # greenautarky/influxDBv1, let an armv7 base migration be reviewed,
+      # proven on real K31 hardware and merged while CI went on building the
+      # frozen base (Debian 13.1, 85 fixable HIGH/CRITICAL, against 0 on the
+      # declared one).
+      #
+      # The resolver lives in the PUBLIC greenautarky/vibe_addons so any
+      # workflow can check it out without a cross-repo token, and it ships with
+      # must-pass/must-fail fixtures that run on every change to it.
+      #
+      # NOT A VALUE CHANGE. Byte-identical on all three arches:
+      #   aarch64  ghcr.io/hassio-addons/base/aarch64:18.1.1
+      #   amd64    ghcr.io/hassio-addons/base/amd64:18.1.1
+      #   armv7    ghcr.io/hassio-addons/base/armv7:18.1.1
+      # No image content changes and no version is bumped. What changes is that
+      # tailscale/build.yaml is now load-bearing instead of decorative.
+      - name: Checkout the store repo (public — carries the base resolver)
+        uses: actions/checkout@v4
+        with:
+          repository: greenautarky/vibe_addons
+          path: .store
+
+      - name: Install PyYAML
+        run: pip install --quiet "PyYAML>=6,<7"
+
       - name: Resolve base image
         id: base
         shell: bash
         run: |
-          # Base images from build.yaml (Alpine-based for Tailscale)
-          echo "img=ghcr.io/hassio-addons/base/${{ matrix.ha_arch }}:18.1.1" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          f="${{ env.ADDON_DIR }}/build.yaml"
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing. ga_tailscale declares its base there for all three arches; a missing declaration is a build error, not a reason to build something else."
+            exit 1
+          fi
+          img=$(python3 .store/scripts/resolve_addon_base.py \
+                  --addon-dir "${{ env.ADDON_DIR }}" \
+                  --arch "${{ matrix.ha_arch }}" \
+                  --legacy-tag UNREACHABLE)
+          echo "img=$img" >> "$GITHUB_OUTPUT"
+          echo "Using base: $img"
 
       - name: Build & Push (${{ matrix.ha_arch }})
         uses: docker/build-push-action@v6
