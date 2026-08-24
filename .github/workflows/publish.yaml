@@ -2,7 +2,7 @@ name: Build & Push (GHCR) - ga_tailscale
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "ga-build/**" ]
     paths:
       - "tailscale/**"
       - ".github/workflows/publish.yaml"
