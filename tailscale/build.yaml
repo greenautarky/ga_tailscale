@@ -1,8 +1,18 @@
 ---
 build_from:
-  aarch64: ghcr.io/hassio-addons/base/aarch64:18.1.1
-  amd64: ghcr.io/hassio-addons/base/amd64:18.1.1
-  armv7: ghcr.io/hassio-addons/base/armv7:18.1.1
+  # 18.1.1 was the FROZEN upstream line — the last tags that still carried armv7.
+  # Once armv7 moved to our own base that reason expired, and the first real run
+  # of the CVE gate measured what staying cost: a pile of FIXABLE HIGH/CRITICALs,
+  # every one of which a patched Alpine package already exists for. Same finding,
+  # same numbers, same fix as the six add-ons migrated on 2026-08-20 — this one
+  # was simply not in that batch.
+  #
+  # aarch64 + amd64: upstream still builds these, kept CURRENT rather than pinned
+  #   to whatever tag last happened to work.
+  # armv7: our own, because upstream stopped building it.
+  aarch64: ghcr.io/hassio-addons/base:21.0.2
+  amd64: ghcr.io/hassio-addons/base:21.0.2
+  armv7: ghcr.io/greenautarky/ga-addon-base-armv7:3.24
 codenotary:
   base_image: codenotary@frenck.dev
   signer: codenotary@frenck.dev

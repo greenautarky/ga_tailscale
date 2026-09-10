@@ -78,29 +78,146 @@ jobs:
         with:
           images: |
             ${{ env.IMAGE_NS }}/${{ env.ADDON_SLUG }}-${{ matrix.ha_arch }}
+          # Release tags (:latest, :<version>) ONLY from the default branch.
+          # This repo carries a repository.json, so it is a valid HA add-on
+          # store in its own right: a test device adds it and installs the real
+          # artifact over the real Supervisor path. Branch builds feed THAT and
+          # get a branch/sha tag; :latest and version tags belong to the
+          # collector store (vibe_addons) and to what the OS bakes.
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.ver.outputs.value }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.ver.outputs.value }},enable={{is_default_branch}}
             type=ref,event=tag
+            type=ref,event=branch,enable=${{ github.ref_name != github.event.repository.default_branch }}
+            type=sha,enable=${{ github.ref_name != github.event.repository.default_branch }}
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+
+      # THE BASE IS DECLARED IN tailscale/build.yaml AND RESOLVED BY ONE SHARED
+      # IMPLEMENTATION. A pipeline that looks it up any other way is a defect
+      # even when it currently produces the right answer — and this one did
+      # produce the right answer, which is precisely why it survived.
+      #
+      # The step that was here emitted a LITERAL, under a comment that said
+      # "Base images from build.yaml". It read no file. The literal happened to
+      # equal every value in tailscale/build.yaml (measured 2026-08-20, all
+      # three arches identical), so nothing was ever wrong and nothing ever
+      # went red. Editing tailscale/build.yaml would have changed nothing about
+      # the image that was built — the same coupling that, in
+      # greenautarky/influxDBv1, let an armv7 base migration be reviewed,
+      # proven on real K31 hardware and merged while CI went on building the
+      # frozen base (Debian 13.1, 85 fixable HIGH/CRITICAL, against 0 on the
+      # declared one).
+      #
+      # The resolver lives in the PUBLIC greenautarky/vibe_addons so any
+      # workflow can check it out without a cross-repo token, and it ships with
+      # must-pass/must-fail fixtures that run on every change to it.
+      #
+      # NOT A VALUE CHANGE. Byte-identical on all three arches:
+      #   aarch64  ghcr.io/hassio-addons/base/aarch64:18.1.1
+      #   amd64    ghcr.io/hassio-addons/base/amd64:18.1.1
+      #   armv7    ghcr.io/hassio-addons/base/armv7:18.1.1
+      # No image content changes and no version is bumped. What changes is that
+      # tailscale/build.yaml is now load-bearing instead of decorative.
+      - name: Checkout the store repo (public — carries the base resolver)
+        uses: actions/checkout@v4
+        with:
+          repository: greenautarky/vibe_addons
+          path: .store
+
+      - name: Install PyYAML
+        run: pip install --quiet "PyYAML>=6,<7"
 
       - name: Resolve base image
         id: base
         shell: bash
         run: |
-          # Base images from build.yaml (Alpine-based for Tailscale)
-          echo "img=ghcr.io/hassio-addons/base/${{ matrix.ha_arch }}:18.1.1" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          f="${{ env.ADDON_DIR }}/build.yaml"
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing. ga_tailscale declares its base there for all three arches; a missing declaration is a build error, not a reason to build something else."
+            exit 1
+          fi
+          img=$(python3 .store/scripts/resolve_addon_base.py \
+                  --addon-dir "${{ env.ADDON_DIR }}" \
+                  --arch "${{ matrix.ha_arch }}" \
+                  --legacy-tag UNREACHABLE)
+          echo "img=$img" >> "$GITHUB_OUTPUT"
+          echo "Using base: $img"
 
-      - name: Build & Push (${{ matrix.ha_arch }})
+      # ORDER IS LOAD-BEARING: build -> scan -> push. The image is pushed ONLY
+      # if the CVE gate below passes, so a fixable HIGH/CRITICAL in the distro
+      # layer can never reach GHCR. An earlier version pushed first and scanned
+      # after — that scans nothing you can un-ship. Modelled on the proven
+      # build.yaml in greenautarky/ga-addon-base (and ha-supervisor#21,
+      # ga_manager#208). Each matrix job is single-platform (one ha_arch), so
+      # `--load` works and there is a real local image to scan before it exists
+      # in the registry. The build itself is UNCHANGED (Alpine base) — only the
+      # order is reworked.
+      - name: Build (${{ matrix.ha_arch }}) — load, no push yet
         uses: docker/build-push-action@v6
         with:
           context: ./${{ env.ADDON_DIR }}
           platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: local/${{ env.ADDON_SLUG }}:scan
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_FROM=${{ steps.base.outputs.img }}
             BUILD_ARCH=${{ matrix.ha_arch }}
+
+      # CVE GATE on the DISTRO layer. A fixable HIGH/CRITICAL means a patched
+      # package exists, so a rebuild fixes it — we FAIL and the image is NOT
+      # pushed. `--ignore-unfixed` so a distro CVE with no fix yet cannot wedge
+      # the release permanently. Scans the LOCAL image built above, before it
+      # exists in any registry.
+      #
+      # Through scripts/cve-gate.sh, NOT a bare trivy call. The bare form this
+      # replaces returns SUCCESS when it matches ZERO packages: an image trivy
+      # has no matcher for produces an empty report and a clean exit, and there
+      # is nothing in the output to tell the two apart. The gate counts what was
+      # actually evaluated and exits 2 — BROKEN SCAN, never a pass — when that
+      # is zero.
+      #
+      # Vendored byte-identically from greenautarky/ha-operating-system, which
+      # the script names as its canonical home, together with its fixtures.
+      # Change it there first, then re-vendor.
+      - name: CVE GATE — distro packages (fixable HIGH/CRITICAL block the push)
+        run: scripts/cve-gate.sh "local/${{ env.ADDON_SLUG }}:scan"
+
+      # REPORT the bundled application libraries (the tailscale binary and other
+      # prebuilt deps) — fixable only when those versions are bumped, so surface
+      # for visibility but never block the push. Runs even if the gate above
+      # failed, so the full picture is logged.
+      - name: CVE report — bundled libraries (visibility, non-gating)
+        if: always()
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --scanners vuln --pkg-types library \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 --no-progress \
+            local/${{ env.ADDON_SLUG }}:scan
+
+      # Reached only if the CVE gate passed. Tag the vetted local image with the
+      # exact tags docker/metadata-action produced (the same
+      # ghcr.io/greenautarky/ga_tailscale-<arch>:<version> + :latest scheme the
+      # build-push step used to push directly) and push each one.
+      - name: Push (gate passed — publish the vetted image)
+        run: |
+          set -euo pipefail
+          tags="${{ steps.meta.outputs.tags }}"
+          pushed=0
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            docker tag local/${{ env.ADDON_SLUG }}:scan "$t"
+            docker push "$t"
+            pushed=$((pushed + 1))
+          done <<< "$tags"
+          if [ "$pushed" -eq 0 ]; then
+            echo "::error::no tags resolved from metadata-action — nothing was pushed"
+            exit 1
+          fi
+          echo "Pushed $pushed tag(s) for ${{ matrix.ha_arch }}"
